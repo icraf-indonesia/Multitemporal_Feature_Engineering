@@ -55,7 +55,22 @@ flowchart TD
 ### Dual-Mode Flexibility: CCDC vs. Direct Image Collection Queries
 Because **Stage 1** returns a clean, cloud-masked, and band-harmonized `ee.ImageCollection`, the input modules can be used **independently of CCDC**:
 - **`temporalMode: 'ccdc'`**: Feeds the collection (scaled to $0\text{–}10000$) into CCDC temporal segmentation for multi-year harmonic modeling.
-- **`temporalMode: 'composite'`**: Returns the collection (scaled to $0\text{–}1$ reflectance) for direct date/region queries, seasonal median/percentile reductions, or rapid single-year classification where multi-temporal segmentation is unnecessary. Both paths emit identical band names (`['blue', 'green', 'red', 'nir', 'swir1', 'swir2']`), allowing [`src/features.js`](file:///c:/Users/AFahrezi/Documents/GitHub/Temporal_segment_gee/src/features.js) to compute spectral indices, phenological deltas, and GLCM textures without modification.
+- **`temporalMode: 'composite'`**: Returns the collection (scaled to $0\text{–}1$ reflectance) for direct date/region queries, seasonal median/percentile reductions, or rapid single-year classification where multi-temporal segmentation is unnecessary. Both paths emit identical band names (`['blue', 'green', 'red', 'nir', 'swir1', 'swir2']`), allowing [`src/features.js`](../src/features.js) (and future Python feature modules) to compute spectral indices, phenological deltas, and GLCM textures without modification.
+
+### Dual-Runtime Module Mapping (GEE JS & Python API)
+
+Both the GEE Code Editor JavaScript library (`src/`) and the Python Earth Engine package (`python/src/ccdc_segment/`) implement this exact three-stage pipeline with matching scientific defaults:
+
+| Pipeline Stage | GEE JavaScript (`src/`) | Python API (`ccdc_segment`) |
+|---|---|---|
+| Stage 1: Optical Harmonization | `src/inputs/landsat.js`, `src/inputs/s2.js` | `ccdc_segment.inputs.landsat`, `ccdc_segment.inputs.s2` |
+| Stage 1/2: Temporal Compositing | `src/inputs/composite.js` | `ccdc_segment.inputs.composite` |
+| Stage 2: CCDC Fitting & Export | `src/ccdc/core.js` (`runCCDC`), `src/config.js` | `ccdc_segment.ccdc.fit`, `ccdc_segment.export` |
+| Stage 3: Reconstruction & Harmonics | `src/ccdc/core.js` (`nearestSegment`, `getSyntheticStack`, `getHarmonics`) | `ccdc_segment.ccdc.reconstruct`, `ccdc_segment.ccdc.model.CCDCModel` |
+| Stage 3: Stability Filtering | `src/ccdc/core.js` (`stableInPeriod`) | `ccdc_segment.ccdc.stability` |
+| Project Configuration | `src/config.js` | `ccdc_segment.config.ProjectConfig` (external JSON/YAML) |
+
+For Python API recipes and JS-to-Python migration notes, see [Python API Guide](PYTHON_API_GUIDE.md).
 
 ---
 
@@ -124,7 +139,13 @@ where:
 | `lambda` | `20` | LASSO penalty parameter (calibrated for $0\text{–}10000$ reflectance units) |
 | `maxIterations` | `25000` | Maximum LASSO coordinate descent iterations |
 
-To stay within GEE compute limits across national extents, exports are partitioned into 5 sub-regional tiles (`west_box`, `central_timor`, `off_dili`, `east_box`, `east_timor`), retaining only the bands required downstream (`['tStart', 'tEnd', 'tBreak', 'changeProb', '.*_coefs']`) and using **`pyramidingPolicy: {'.default': 'sample'}`** (mandatory for array-valued GEE images).
+To stay within GEE compute limits across national extents, exports are partitioned into sub-regional tiles (e.g., 5 tiles in Timor-Leste: `west_box`, `central_timor`, `off_dili`, `east_box`, `east_timor`, or generated programmatically via `ccdc_segment.export.make_tile_grid`), retaining only the bands required downstream (`['tStart', 'tEnd', 'tBreak', 'changeProb', '.*_coefs']`) and using **`pyramidingPolicy: {'.default': 'sample'}`** (mandatory for array-valued GEE images).
+
+> [!NOTE]
+> **Python API Parity & Safeguards:**
+> - In Python (`ccdc_segment.ccdc.CCDCParams`), the LASSO penalty is named `lambda_` (since `lambda` is a Python keyword) and serialized to `"lambda"` when calling `ee.Algorithms.TemporalSegmentation.Ccdc`. Explicit `lambda_=0.0` is preserved rather than falling back to `20`.
+> - `ccdc_segment.inputs.composite.seasonal_composite` computes the exclusive end date via `ee.Date.fromYMD(year, end_month, 1).advance(1, "month")`, avoiding calendar rollover errors when `end_month == 12`.
+> - `ccdc_segment.export.export_ccdc_tiles` automatically trims auxiliary bands (`prepare_ccdc_for_export`), enforces `pyramidingPolicy={'.default': 'sample'}`, supports `skip_existing=True` idempotent resumes via `ee.data.getAsset`, and defaults to `start=False` dry runs.
 
 ---
 
@@ -183,10 +204,10 @@ The stability filter evaluates three conditions over any interval $[t_{\text{sta
    No segment break with `changeProb == 1` occurred inside the interval:
    $$\forall s,\quad \text{changeProb}_s = 1 \implies t_{\text{break}, s} \notin [t_{\text{start}}, t_{\text{end}}]$$
 2. **Continuous Single-Segment Coverage**:
-   Both the historical evaluation date ($t_{\text{start}} + 0.50$) and the baseline date ($\lfloor t_{\text{end}} \rfloor + 0.50$) fall within gap tolerance $\tau_{\text{gap}}$ **and** map to the exact same CCDC segment index:
+   Both the historical evaluation date ($\lfloor t_{\text{start}} \rfloor + 0.50$) and the baseline date ($\lfloor t_{\text{end}} \rfloor + 0.50$) fall within gap tolerance $\tau_{\text{gap}}$ **and** map to the exact same CCDC segment index:
    $$\text{gap}(t_{\text{start}}) \le \tau_{\text{gap}} \;\land\; \text{gap}(t_{\text{end}}) \le \tau_{\text{gap}} \;\land\; s^*(t_{\text{start}}) = s^*(t_{\text{end}})$$
 3. **Gradual Linear Drift Constraint**:
-   Even without a discrete breakpoint, slow forest degradation, regrowth, or gradual encroachment can alter a pixel's class over 10–20 years. The cumulative reflectance drift in NIR and SWIR1 across $\Delta t = t_{\text{end}} - t_{\text{start}}$ must remain below $\Delta\rho_{\max} = 0.12$:
+   Even without a discrete breakpoint, slow forest degradation, regrowth, or gradual encroachment can alter a pixel's class over 10–20 years. The cumulative reflectance drift in NIR and SWIR1 (configurable via `drift_bands` in Python) across $\Delta t = t_{\text{end}} - t_{\text{start}}$ must remain below $\Delta\rho_{\max} = 0.12$:
    $$\left|\frac{c_{1,\text{nir}}}{\text{coefScale}} \cdot \Delta t\right| \le 0.12 \quad \land \quad \left|\frac{c_{1,\text{swir1}}}{\text{coefScale}} \cdot \Delta t\right| \le 0.12$$
 
 For polygon training samples, `ee.Reducer.min()` is applied over `stable_{year}` so that a polygon is retained only if **every constituent pixel** inside the polygon remained stable throughout the period.
@@ -195,15 +216,20 @@ For polygon training samples, `ee.Reducer.min()` is applied over `stable_{year}`
 
 ## 7. Asset Metadata & Backward Compatibility Profile
 
-To ensure the unified post-CCDC core works seamlessly across existing Timor-Leste CCDC assets, Google's global pre-computed CCDC archive, and newly generated runs for other regions, CCDC asset descriptors in [`src/config.js`](file:///c:/Users/AFahrezi/Documents/GitHub/Temporal_segment_gee/src/config.js) carry explicit metadata rather than relying on hardcoded sensor assumptions:
+To ensure the unified post-CCDC core works seamlessly across existing Timor-Leste CCDC assets, Google's global pre-computed CCDC archive, and newly generated runs for other regions, CCDC asset descriptors carry explicit metadata rather than relying on hardcoded sensor assumptions. In GEE JavaScript these parameters are passed via options alongside [`src/config.js`](../src/config.js); in Python they are encapsulated in the frozen `ccdc_segment.ccdc.CCDCProfile` dataclass with built-in presets:
 
-| Asset Property | Options | Purpose |
-|---|---|---|
-| `tiles` | `Array<string>` | List of GEE Image asset IDs to mosaic (or a single `ee.ImageCollection` ID) |
-| `coefScale` | `10000` or `1` | Divisor applied to `*_coefs` (`10000` for custom runs; `1` for `GOOGLE/GLOBAL_CCDC/V1`) |
-| `coefCase` | `'lower'` or `'upper'` | Case used when selecting `*_coefs` in the stored CCDC asset (`'upper'` for legacy `BLUE_coefs`; `'lower'` for standard `blue_coefs`) |
-| `harmCase` | `'lower'` or `'upper'` | Output band prefix case for harmonic bands (`'upper'` emits `NIR_amp` to match legacy Landsat RFECV lists; `'lower'` emits `nir_amp`) |
-| `bounds` | `{ min: -0.05, max: 1.0 }` | Physical surface reflectance validity interval |
+| Asset Property | Python `CCDCProfile` Field | Options | Purpose |
+|---|---|---|---|
+| `tiles` | `ProjectConfig.ccdc_tiles` | `list[str]` / `ImageCollection` | List of GEE Image asset IDs to mosaic (or a single `ee.ImageCollection` ID) |
+| `coefScale` | `coef_scale` | `10000` or `1` | Divisor applied to `*_coefs` (`10000` for custom runs; `1` for `GOOGLE/GLOBAL_CCDC/V1`) |
+| `coefCase` | `coef_case` | `'lower'` or `'upper'` | Case used when selecting `*_coefs` in the stored CCDC asset (`'upper'` for legacy `BLUE_coefs`; `'lower'` for standard `blue_coefs`) |
+| `harmCase` | `harm_case` | `'lower'` or `'upper'` | Output band prefix case for harmonic bands (`'upper'` emits `NIR_amp` to match legacy Landsat RFECV lists; `'lower'` emits `nir_amp`) |
+| `bounds` | `bounds` (`ReflectanceBounds`) | `{ min: -0.05, max: 1.0 }` | Physical surface reflectance validity interval |
+
+**Built-in Python Presets:**
+- `CCDCProfile.standard()`: `coef_scale=10000.0`, `coef_case="lower"`, `harm_case="lower"`
+- `CCDCProfile.landsat_legacy()`: `coef_scale=10000.0`, `coef_case="upper"`, `harm_case="upper"`
+- `CCDCProfile.google_global()`: `coef_scale=1.0`, `coef_case="upper"`, `harm_case="lower"` (`GOOGLE/GLOBAL_CCDC/V1`)
 
 ---
 
